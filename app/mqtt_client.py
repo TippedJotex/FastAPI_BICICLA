@@ -36,7 +36,9 @@ reconnecting = False
 
 base_id = os.getenv("MQTT_CLIENT_ID", "bicicla-backend")
 MQTT_CLIENT_ID = f"{base_id}-{os.getpid()}"
-client = MQTTClient(MQTT_CLIENT_ID)
+# clean_session=True asegura que cada conexión inicie limpia sin estado retenido
+# Esto previene la acumulación de IDs de mensajes entre reconexiones
+client = MQTTClient(MQTT_CLIENT_ID, clean_session=True, optimistic_acknowledgement=True)
 print(f"🆔 Usando MQTT_CLIENT_ID: {MQTT_CLIENT_ID}")
 
 
@@ -82,7 +84,9 @@ def on_connect(client, flags, rc, properties):
     global mqtt_failure_count
     print("✅ Conectado a MQTT Broker")
     mqtt_failure_count = 0  # Reiniciar contador al tener éxito
-    client.subscribe('Bramal/Bicicla/#', qos=1)
+    # QoS 0: Entrega "at most once" sin confirmación, previene overflow de IDs
+    # Para datos de sensores, es aceptable perder algunos mensajes ocasionales
+    client.subscribe('Bramal/Bicicla/#', qos=0)
 
 def on_disconnect(client, packet, exc=None):
     global mqtt_failure_count
@@ -112,7 +116,15 @@ async def reconnect_loop():
             try:
                 print(f"🔄 Reintentando conexión MQTT en {delay}s...")
                 await asyncio.sleep(delay)
-                await client.connect(MQTT_BROKER, MQTT_PORT)
+                
+                # Asegurar desconexión limpia antes de reconectar
+                try:
+                    await client.disconnect()
+                    await asyncio.sleep(0.5)  # Dar tiempo para limpieza
+                except:
+                    pass  # Ignorar errores si ya estaba desconectado
+                
+                await client.connect(MQTT_BROKER, MQTT_PORT, version=4)  # version=4 es MQTT 3.1.1
                 print("✅ Re-conexión MQTT establecida correctamente")
                 break
             except Exception as e:
@@ -468,7 +480,8 @@ async def connect_mqtt():
     while True:
         try:
             print(f"⏳ Iniciando conexión MQTT a {MQTT_BROKER}:{MQTT_PORT}...")
-            await client.connect(MQTT_BROKER, MQTT_PORT)
+            # version=4 especifica MQTT 3.1.1 para mejor compatibilidad
+            await client.connect(MQTT_BROKER, MQTT_PORT, version=4)
             print(f"🔌 Conexión MQTT establecida correctamente")
             return client
         except Exception as e:
