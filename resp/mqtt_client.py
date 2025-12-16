@@ -1,0 +1,337 @@
+from gmqtt import Client as MQTTClient
+import asyncio
+import json
+from mysql.connector.connection import MySQLConnection
+import os
+import sys
+import time
+from dotenv import load_dotenv
+import datetime
+
+# Cargar variables de entorno desde la ubicación correcta en el servidor de producción
+load_dotenv("/home/ubuntu/FastAPI_BICICLA/.env")
+
+# Configuración desde variables de entorno
+MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "bicicla_client")
+MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USER = os.getenv("MQTT_USER", "")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+
+# Configuración de reintentos
+MAX_DB_RETRY_DELAY = 10    # Máximo tiempo entre reintentos para DB (segundos)
+MAX_MQTT_RETRY_DELAY = 5   # Máximo tiempo entre reintentos para MQTT (segundos)
+CRITICAL_FAILURE_COUNT = 10 # Después de estos fallos, reinicia todo el proceso
+
+# Contadores de fallos
+db_failure_count = 0
+mqtt_failure_count = 0
+
+# Cliente MQTT
+client = MQTTClient(MQTT_CLIENT_ID)
+
+# Pool de conexiones a la base de datos
+from app.database import connection_pool
+
+# --- Reinicio de aplicación ---
+def restart_application():
+    """Reinicia completamente la aplicación en caso de fallos graves"""
+    print("🔄 REINICIANDO APLICACIÓN COMPLETA...")
+    python = sys.executable
+    os.execv(python, [python] + sys.argv)
+    # Esta función será reemplazada por main.py para manejar reinicio seguro
+
+# --- Manejo de base de datos ---
+def get_db_connection():
+    """Obtiene una conexión a la base de datos con reintentos"""
+    global db_failure_count
+    delay = 1
+    
+    while True:
+        try:
+            conn = connection_pool.get_connection()
+            db_failure_count = 0  # Reiniciar contador al tener éxito
+            return conn
+        except Exception as e:
+            db_failure_count += 1
+            print(f"❌ Error al conectar a la base de datos (intento {db_failure_count}): {e}")
+            
+            if db_failure_count >= CRITICAL_FAILURE_COUNT:
+                print("❗ FALLO CRÍTICO: Demasiados errores de conexión a la base de datos")
+                restart_application()
+                
+            print(f"🔄 Reintentando conexión a DB en {delay}s...")
+            time.sleep(delay)
+            delay = min(delay * 1.5, MAX_DB_RETRY_DELAY)
+
+# --- Conexión y reconexión MQTT ---
+def on_connect(client, flags, rc, properties):
+    global mqtt_failure_count
+    print("✅ Conectado a MQTT Broker")
+    mqtt_failure_count = 0  # Reiniciar contador al tener éxito
+    client.subscribe('Bramal/Bicicla/#', qos=1)
+
+def on_disconnect(client, packet, exc=None):
+    global mqtt_failure_count
+    mqtt_failure_count += 1
+    print(f"⚠️ Desconectado del broker MQTT (desconexión {mqtt_failure_count})")
+    
+    if mqtt_failure_count >= CRITICAL_FAILURE_COUNT:
+        print("❗ FALLO CRÍTICO: Demasiadas desconexiones del broker MQTT")
+        restart_application()
+    else:
+        asyncio.create_task(reconnect_loop())
+
+async def reconnect_loop():
+    delay = 1
+    while True:
+        try:
+            print(f"🔄 Reintentando conexión MQTT en {delay}s...")
+            await asyncio.sleep(delay)
+            await client.connect(MQTT_BROKER, MQTT_PORT)
+            break
+        except Exception as e:
+            print(f"❌ Falló reconexión MQTT: {e}")
+            delay = min(delay * 1.5, MAX_MQTT_RETRY_DELAY)
+
+# --- Procesamiento de mensajes ---
+def on_message(client, topic, payload, qos, properties):
+    conn = None
+    cursor = None
+
+    try:
+        print(f"📩 Mensaje MQTT recibido: Tópico={topic}, Payload={payload}")
+
+        parts = topic.split("/")
+        if len(parts) != 6:
+            print(f"❌ Tópico inválido: {topic}")
+            return
+
+        _, _, tipo_equipo, comuna, ubicacion_endpoint, sensor = parts
+        sensor = sensor.strip().upper()
+
+        # Verificación preliminar - si no es sensor BC, solo ignoramos
+        if not sensor.startswith("BC"):
+            print(f"⚠️ Ignorando mensaje: Sensor {sensor} no es de tipo BC")
+            return
+
+        # Solo obtenemos conexión a DB para sensores que procesaremos
+        # Usamos nuestra función mejorada con reintentos
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # Iniciar transacción para evitar problemas de concurrencia
+        conn.start_transaction()
+
+        print(f"📥 Procesando: {tipo_equipo} - {comuna} - {ubicacion_endpoint} - {sensor}")
+
+        # 1. Verificar si la ubicación ya existe
+        cursor.execute("""
+            SELECT ID_UBICACION FROM UBICACIONES
+            WHERE UBICACION_ENDPOINT = %s
+        """, (ubicacion_endpoint,))
+        ubicacion_row = cursor.fetchone()
+
+        if ubicacion_row:
+            # Usar ID existente
+            id_ubicacion = ubicacion_row["ID_UBICACION"]
+            print(f"📍 Usando ubicación existente (ID: {id_ubicacion})")
+
+            # Asegurar que los datos estén actualizados
+            cursor.execute("""
+                UPDATE UBICACIONES
+                SET COMUNA = %s, TIPO_EQUIPO = %s
+                WHERE ID_UBICACION = %s
+            """, (comuna, tipo_equipo, id_ubicacion))
+        else:
+            # Insertar nueva ubicación
+            cursor.execute("""
+                INSERT INTO UBICACIONES
+                (COMUNA, UBICACION_ENDPOINT, TIPO_EQUIPO)
+                VALUES (%s, %s, %s)
+            """, (comuna, ubicacion_endpoint, tipo_equipo))
+
+            # Obtener ID de la ubicación recién insertada
+            cursor.execute("SELECT LAST_INSERT_ID() as ID_UBICACION")
+            id_ubicacion = cursor.fetchone()["ID_UBICACION"]
+            print(f"🆕 Nueva ubicación creada (ID: {id_ubicacion})")
+
+        # 2. Verificar si el sensor ya existe para esta ubicación
+        cursor.execute("""
+            SELECT ID_SENSOR FROM SENSORES
+            WHERE NOMBRE_SENSOR = %s AND ID_UBICACION = %s
+        """, (sensor, id_ubicacion))
+        sensor_row = cursor.fetchone()
+
+        if sensor_row:
+            # Usar ID existente
+            id_sensor = sensor_row["ID_SENSOR"]
+            print(f"🔍 Usando sensor existente (ID: {id_sensor})")
+        else:
+            # Insertar nuevo sensor
+            cursor.execute("""
+                INSERT INTO SENSORES
+                (NOMBRE_SENSOR, ID_UBICACION)
+                VALUES (%s, %s)
+            """, (sensor, id_ubicacion))
+
+            # Obtener ID del sensor recién insertado
+            cursor.execute("SELECT LAST_INSERT_ID() as ID_SENSOR")
+            id_sensor = cursor.fetchone()["ID_SENSOR"]
+            print(f"🆕 Nuevo sensor creado (ID: {id_sensor})")
+
+        # 3. Obtener información de dirección del payload
+        try:
+            data = json.loads(payload)
+            direction = data.get("direction", "Desconocido")
+        except:
+            direction = "Desconocido"
+            print("⚠️ Error al parsear payload JSON, usando dirección 'Desconocido'")
+
+        # 4. Verificar si ya existe el registro de sentido para este sensor
+        cursor.execute("""
+            SELECT ID, SENTIDO_LECTURA FROM SENTIDOS_SENSOR
+            WHERE ID_SENSOR = %s AND DIRECCION = %s
+        """, (id_sensor, direction))
+        sentido_row = cursor.fetchone()
+
+        if sentido_row:
+            # Usar sentido existente
+            sentido_lectura = sentido_row["SENTIDO_LECTURA"]
+            print(f"🔍 Usando sentido existente: {sentido_lectura if sentido_lectura else 'NULL'}")
+        else:
+            # Insertar nuevo sentido
+            cursor.execute("""
+                INSERT INTO SENTIDOS_SENSOR
+                (ID_SENSOR, DIRECCION, SENTIDO_LECTURA)
+                VALUES (%s, %s, NULL)
+            """, (id_sensor, direction))
+            sentido_lectura = None
+            print(f"🆕 Nuevo sentido creado para dirección: {direction}")
+
+        # 5. Verificar la estructura de la tabla LECTURAS
+        cursor.execute("DESCRIBE BICICLA.LECTURAS")
+        columnas_lecturas = cursor.fetchall()
+        print(f"Estructura de tabla LECTURAS: {[col['Field'] for col in columnas_lecturas]}")
+
+        # Comprobar si existe campo FECHA_LECTURA
+        tiene_fecha_lectura = any(col['Field'] == 'FECHA_LECTURA' for col in columnas_lecturas)
+
+        # 6. Insertar lectura (siempre se guardan todas las lecturas como histórico)
+        # MODIFICADO: Ahora incluimos ID_SENSOR en la inserción
+        print(f"Insertando lectura: {sensor}, ID_UBICACION: {id_ubicacion}, ID_SENSOR: {id_sensor}")
+
+        if tiene_fecha_lectura:
+            # Si la tabla tiene un campo FECHA_LECTURA, lo incluimos
+            cursor.execute("""
+                INSERT INTO LECTURAS
+                (NOMBRE_SENSOR, ID_UBICACION, ID_SENSOR, COMUNA, UBICACION_ENDPOINT, DIRECCION, SENTIDO_LECTURA, FECHA_LECTURA)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            """, (sensor, id_ubicacion, id_sensor, comuna, ubicacion_endpoint, direction, sentido_lectura))
+        else:
+            # Usar la consulta modificada incluyendo ID_SENSOR
+            cursor.execute("""
+                INSERT INTO LECTURAS
+                (NOMBRE_SENSOR, ID_UBICACION, ID_SENSOR, COMUNA, UBICACION_ENDPOINT, DIRECCION, SENTIDO_LECTURA)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (sensor, id_ubicacion, id_sensor, comuna, ubicacion_endpoint, direction, sentido_lectura))
+
+        print(f"Inserción ejecutada, filas afectadas: {cursor.rowcount}")
+
+        # Confirmar transacción
+        conn.commit()
+        print(f"✅ Procesamiento completo: Sensor {sensor} - Dirección: {direction}")
+
+    except Exception as e:
+        # En caso de error, revertir toda la transacción
+        if conn is not None:
+            try:
+                conn.rollback()
+            except:
+                pass
+        print(f"❌ ERROR en procesamiento: {str(e)}")
+
+        # Información detallada del error para depuración
+        import traceback
+        print(f"Detalles del error: {traceback.format_exc()}")
+    finally:
+        # Asegurar que los recursos se liberen
+        if cursor is not None:
+            try:
+                cursor.close()
+            except:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except:
+                pass
+
+# --- Inicializar conexión MQTT con manejo mejorado ---
+async def connect_mqtt():
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.on_disconnect = on_disconnect
+
+    if MQTT_USER and MQTT_PASSWORD:
+        client.set_auth_credentials(MQTT_USER, MQTT_PASSWORD)
+
+    # Mejorado: bucle de reconexión integrado
+    while True:
+        try:
+            print(f"⏳ Iniciando conexión MQTT a {MQTT_BROKER}:{MQTT_PORT}...")
+            await client.connect(MQTT_BROKER, MQTT_PORT)
+            print(f"🔌 Conexión MQTT establecida correctamente")
+            return client
+        except Exception as e:
+            print(f"❌ Error al conectar con MQTT: {str(e)}")
+            # Esperamos antes de reintentar
+            delay = 1
+            print(f"🔄 Reintentando conexión MQTT inicial en {delay}s...")
+            await asyncio.sleep(delay)
+
+# Función para iniciar el cliente MQTT en background con mejor manejo de errores
+async def start_mqtt_client():
+    try:
+        await connect_mqtt()
+        # Bucle infinito para mantener la conexión y reiniciar si es necesario
+        while True:
+            try:
+                # Esperar indefinidamente mientras la conexión está activa
+                await asyncio.Event().wait()
+            except Exception as e:
+                print(f"⚠️ Error en el bucle principal: {str(e)}")
+                import traceback
+                print(f"Detalles: {traceback.format_exc()}")
+                # Si llegamos aquí, ha ocurrido un error inesperado en el bucle principal
+                # Esperamos un momento y reiniciamos todo
+                await asyncio.sleep(2)
+                restart_application()
+    except Exception as e:
+        print(f"❌ Error crítico en el cliente MQTT: {str(e)}")
+        import traceback
+        print(f"Detalles del error crítico: {traceback.format_exc()}")
+        # Error no recuperable, reiniciamos todo
+        restart_application()
+
+# --- Manejador de señales para cierre seguro ---
+def handle_exit_signals():
+    import signal
+
+    def signal_handler(sig, frame):
+        print("\n⚠️ Señal de interrupción recibida. Cerrando conexiones...")
+        asyncio.create_task(client.disconnect())
+        # Dar tiempo para desconectar correctamente
+        time.sleep(1)
+        sys.exit(0)
+
+    # Registrar manejadores para señales comunes
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+# --- Para pruebas directas ---
+if __name__ == "__main__":
+    handle_exit_signals()
+    print("🚀 Iniciando servicio de monitoreo de bicicletas BICICLA")
+    print("📊 Este servicio registra cada bicicleta detectada por los sensores")
+    asyncio.run(start_mqtt_client())

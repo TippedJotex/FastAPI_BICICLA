@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+gmqtt
+mysql-connector-python
+python-dotenv
